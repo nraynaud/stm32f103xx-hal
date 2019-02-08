@@ -62,13 +62,13 @@ fn main() -> ! {
 
     let mut circ_buffer = rx.circ_read(channels.5, buf);
 
-    while circ_buffer.readable_half().unwrap() != Half::First {}
+    while circ_buffer.get_filled_half().unwrap() != Half::First {}
 
-    let _first_half = circ_buffer.peek(|half, _| *half).unwrap();
+    let _first_half = circ_buffer.retrieve_filled_half(|half, _, _| *half).unwrap();
 
-    while circ_buffer.readable_half().unwrap() != Half::Second {}
+    while circ_buffer.get_filled_half().unwrap() != Half::Second {}
 
-    let _second_half = circ_buffer.peek(|half, _| *half).unwrap();
+    let _second_half = circ_buffer.retrieve_filled_half(|half, _, _| *half).unwrap();
 
     asm::bkpt();
 

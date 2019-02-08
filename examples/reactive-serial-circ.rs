@@ -11,14 +11,15 @@ use cortex_m::asm;
 use stm32f103xx_hal::{
     prelude::*,
     dma::{dma1, CircBuffer, Event},
-    serial::Serial,
+    serial::{Serial, Rx},
 };
+use stm32f103xx::USART1;
 use rtfm::app;
 
 #[app(device = stm32f103xx_hal::device)]
 const APP: () = {
     static mut BUFFER: [[u8; 8]; 2] = [[0; 8]; 2];
-    static mut CB: CircBuffer<[u8; 8], dma1::C5> = ();
+    static mut CB: CircBuffer<[u8; 8], dma1::C5, Rx<USART1>> = ();
 
     #[init(resources = [BUFFER])]
     fn init() {
@@ -68,7 +69,7 @@ const APP: () = {
     #[interrupt(resources = [CB])]
     fn DMA1_CHANNEL5() {
         resources.CB
-            .peek(|_buf, _half| {
+            .retrieve_filled_half(|_buf, _half, _len| {
                 asm::bkpt();
             })
             .unwrap();

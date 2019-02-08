@@ -59,7 +59,7 @@ fn main() -> ! {
         &mut rcc.apb1,
     );
 
-    let (mut tx, mut rx) = serial.split();
+    let (mut tx, mut rx, _) = serial.split();
 
     let sent = b'X';
 

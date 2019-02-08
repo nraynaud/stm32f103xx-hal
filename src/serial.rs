@@ -14,6 +14,7 @@ use crate::gpio::gpiob::{PB10, PB11, PB6, PB7};
 use crate::gpio::{Alternate, Floating, Input, PushPull};
 use crate::rcc::{APB1, APB2, Clocks};
 use crate::time::Bps;
+use embedded_hal::serial::Write;
 
 /// Interrupt event
 pub enum Event {
@@ -21,6 +22,8 @@ pub enum Event {
     Rxne,
     /// New data can be sent
     Txe,
+    /// Receive line is idle
+    Idle,
 }
 
 /// Serial error
@@ -76,6 +79,10 @@ pub struct Serial<USART, PINS> {
     pins: PINS,
 }
 
+pub struct ReleaseToken<USART, PINS> {
+    serial: Serial<USART, PINS>
+}
+
 /// Serial receiver
 pub struct Rx<USART> {
     _usart: PhantomData<USART>,
@@ -84,6 +91,14 @@ pub struct Rx<USART> {
 /// Serial transmitter
 pub struct Tx<USART> {
     _usart: PhantomData<USART>,
+}
+
+impl<USART, PINS: Pins<USART>> ReleaseToken<USART, PINS> {
+    pub fn release(self, _rx: Rx<USART>, mut tx: Tx<USART>) -> Serial<USART, PINS>
+        where Tx<USART>: crate::hal::serial::Write<u8> {
+        nb::block!(tx.flush()).ok();
+        self.serial
+    }
 }
 
 macro_rules! hal {
@@ -143,6 +158,7 @@ macro_rules! hal {
                     match event {
                         Event::Rxne => self.usart.cr1.modify(|_, w| w.rxneie().set_bit()),
                         Event::Txe => self.usart.cr1.modify(|_, w| w.txeie().set_bit()),
+                        Event::Idle => self.usart.cr1.modify(|_, w| w.idleie().set_bit()),
                     }
                 }
 
@@ -150,6 +166,7 @@ macro_rules! hal {
                     match event {
                         Event::Rxne => self.usart.cr1.modify(|_, w| w.rxneie().clear_bit()),
                         Event::Txe => self.usart.cr1.modify(|_, w| w.txeie().clear_bit()),
+                        Event::Idle => self.usart.cr1.modify(|_, w| w.idleie().clear_bit()),
                     }
                 }
 
@@ -157,13 +174,16 @@ macro_rules! hal {
                     (self.usart, self.pins)
                 }
 
-                pub fn split(self) -> (Tx<$USARTX>, Rx<$USARTX>) {
+                pub fn split(self) -> (Tx<$USARTX>, Rx<$USARTX>, ReleaseToken<$USARTX, PINS>) {
                     (
                         Tx {
                             _usart: PhantomData,
                         },
                         Rx {
                             _usart: PhantomData,
+                        },
+                        ReleaseToken {
+                            serial: self
                         },
                     )
                 }
@@ -216,7 +236,7 @@ macro_rules! hal {
 
             impl<B> ReadDma<B> for Rx<$USARTX> where B: AsMut<[u8]> {
                 fn circ_read(self, mut chan: Self::Dma, buffer: &'static mut [B; 2],
-                ) -> CircBuffer<B, Self::Dma>
+                ) -> CircBuffer<B, Self::Dma, Self>
                 {
                     {
                         let buffer = buffer[0].as_mut();
@@ -257,7 +277,7 @@ macro_rules! hal {
                         });
                     }
 
-                    CircBuffer::new(buffer, chan)
+                    CircBuffer::new(buffer, chan, self)
                 }
 
                 fn read_exact(self, mut chan: Self::Dma, buffer: &'static mut B,
@@ -306,12 +326,18 @@ macro_rules! hal {
                 }
             }
 
-            impl<A, B> WriteDma<A, B> for Tx<$USARTX> where A: AsRef<[u8]>, B: Static<A> {
-                fn write_all(self, mut chan: Self::Dma, buffer: B
-                ) -> Transfer<R, B, Self::Dma, Self>
+            impl<A, B> WriteDma<A, B> for Tx<$USARTX> where A: AsRef<[u8]> + ?Sized, B: Static<A> {
+                fn write_all(self, chan: Self::Dma, buffer: B) -> Transfer<R, B, Self::Dma, Self>
                 {
+                    let chan = self.start_dma(chan, buffer.borrow());
+                    Transfer::r(buffer, chan, self)
+                }
+            }
+
+            impl<B: AsRef<[u8]>> DmaWriter<B> for Tx<$USARTX> {
+                fn start_dma(&self, mut chan: Self::Dma, buffer: B) -> Self::Dma {
                     {
-                        let buffer = buffer.borrow().as_ref();
+                        let buffer = buffer.as_ref();
                         chan.cmar().write(|w| unsafe {
                             w.ma().bits(buffer.as_ptr() as usize as u32)
                         });
@@ -348,10 +374,17 @@ macro_rules! hal {
                                 .set_bit()
                         });
                     }
-
-                    Transfer::r(buffer, chan, self)
+                    chan
                 }
             }
+
+            impl<A> WriteDmaImmediately<A> for Tx<$USARTX> where A: AsRef<[u8]> + ?Sized {
+                fn write_immediately(self, chan: Self::Dma, buffer: &A) -> (&A, Self::Dma, Self) {
+                    let chan = self.start_dma(chan, buffer);
+                    Transfer::r(buffer, chan, self).wait()
+                }
+            }
+
 
             impl crate::hal::serial::Write<u8> for Tx<$USARTX> {
                 type Error = Void;
@@ -444,11 +477,11 @@ impl DmaChannel for Tx<USART3> {
 }
 
 pub trait ReadDma<B>: DmaChannel
-where
-    B: AsMut<[u8]>,
-    Self: core::marker::Sized,
+    where
+        B: AsMut<[u8]>,
+        Self: core::marker::Sized,
 {
-    fn circ_read(self, chan: Self::Dma, buffer: &'static mut [B; 2]) -> CircBuffer<B, Self::Dma>;
+    fn circ_read(self, chan: Self::Dma, buffer: &'static mut [B; 2]) -> CircBuffer<B, Self::Dma, Self>;
     fn read_exact(
         self,
         chan: Self::Dma,
@@ -456,11 +489,26 @@ where
     ) -> Transfer<W, &'static mut B, Self::Dma, Self>;
 }
 
+trait DmaWriter<B: AsRef<[u8]> + ?Sized>: DmaChannel
+    where
+        Self: core::marker::Sized,
+{
+    fn start_dma(&self, chan: Self::Dma, buffer: B) ->  Self::Dma;
+}
+
 pub trait WriteDma<A, B>: DmaChannel
-where
-    A: AsRef<[u8]>,
-    B: Static<A>,
-    Self: core::marker::Sized,
+    where
+        A: AsRef<[u8]> + ?Sized,
+        B: Static<A>,
+        Self: core::marker::Sized,
 {
     fn write_all(self, chan: Self::Dma, buffer: B) -> Transfer<R, B, Self::Dma, Self>;
+}
+
+pub trait WriteDmaImmediately<A>: DmaChannel
+    where
+        A: AsRef<[u8]> + ?Sized,
+        Self: core::marker::Sized,
+{
+    fn write_immediately(self, chan: Self::Dma, buffer: &A) -> (&A, Self::Dma, Self);
 }

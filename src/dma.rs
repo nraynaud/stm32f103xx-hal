@@ -23,36 +23,38 @@ pub enum Half {
     Second,
 }
 
-pub struct CircBuffer<BUFFER, CHANNEL>
-where
-    BUFFER: 'static,
+pub struct CircBuffer<BUFFER, CHANNEL, RESOURCE>
+    where
+        BUFFER: 'static,
 {
     buffer: &'static mut [BUFFER; 2],
     channel: CHANNEL,
+    resource: RESOURCE,
     readable_half: Half,
 }
 
-impl<BUFFER, CHANNEL> CircBuffer<BUFFER, CHANNEL> {
-    pub(crate) fn new(buf: &'static mut [BUFFER; 2], chan: CHANNEL) -> Self {
+impl<BUFFER, CHANNEL, RESOURCE> CircBuffer<BUFFER, CHANNEL, RESOURCE> {
+    pub(crate) fn new(buf: &'static mut [BUFFER; 2], chan: CHANNEL, resource: RESOURCE) -> Self {
         CircBuffer {
             buffer: buf,
             channel: chan,
+            resource,
             readable_half: Half::Second,
         }
     }
 }
 
-pub trait Static<B> {
+pub trait Static<B: ?Sized> {
     fn borrow(&self) -> &B;
 }
 
-impl<B> Static<B> for &'static B {
+impl<B: ?Sized> Static<B> for &'static B {
     fn borrow(&self) -> &B {
         *self
     }
 }
 
-impl<B> Static<B> for &'static mut B {
+impl<B: ?Sized> Static<B> for &'static mut B {
     fn borrow(&self) -> &B {
         *self
     }
@@ -192,21 +194,37 @@ macro_rules! dma {
 
                     }
 
-                    impl<B> CircBuffer<B, $CX> {
-                        /// Peeks into the readable half of the buffer
-                        pub fn peek<R, F>(&mut self, f: F) -> Result<R, Error>
-                            where
-                            F: FnOnce(&B, Half) -> R,
+                    impl<B: AsRef<[u8]> , RE> CircBuffer<B, $CX, RE> {
+                        /// peers into the buffer without touching any flag
+                        pub fn peek_whole_buffer<R, F>(&mut self, f: F) -> Result<R, Error>
+                            where F: FnOnce(&B, &B, usize) -> R,
                         {
-                            let half_being_read = self.readable_half()?;
+                            let len = self.buffer[0].as_ref().len();
+                            let written_counter = self.channel.get_cndtr() as usize;
+                             // XXX does this need a compiler barrier?
+                            atomic::compiler_fence(Ordering::SeqCst);
+                            let ret = f(&self.buffer[0], &self.buffer[1], len * 2 - written_counter);
+                            Ok(ret)
+                        }
+
+                        /// Give access to the available half buffer
+                        /// this also flags it as clear to re-fill.
+                        pub fn retrieve_filled_half<R, F>(&mut self, f: F) -> Result<R, Error>
+                            where
+                            F: FnOnce(&B, Half, usize) -> R,
+                        {
+                            let half_being_read = self.get_filled_half()?;
 
                             let buf = match half_being_read {
                                 Half::First => &self.buffer[0],
                                 Half::Second => &self.buffer[1],
                             };
 
+                            let len = buf.as_ref().len();
+                            let written: usize = (len * 2 - self.channel.get_cndtr() as usize) % len;
                             // XXX does this need a compiler barrier?
-                            let ret = f(buf, half_being_read);
+                            atomic::compiler_fence(Ordering::SeqCst);
+                            let ret = f(buf, half_being_read, written);
 
 
                             let isr = self.channel.isr();
@@ -222,7 +240,8 @@ macro_rules! dma {
                         }
 
                         /// Returns the `Half` of the buffer that can be read
-                        pub fn readable_half(&mut self) -> Result<Half, Error> {
+                        /// this also flags it as clear to re-fill.
+                        pub fn get_filled_half(&mut self) -> Result<Half, Error> {
                             let isr = self.channel.isr();
                             let first_half_is_done = isr.$htifX().bit_is_set();
                             let second_half_is_done = isr.$tcifX().bit_is_set();
@@ -255,6 +274,11 @@ macro_rules! dma {
                                     }
                                 }
                             })
+                        }
+
+                        pub fn release(mut self) -> (&'static mut [B; 2], $CX, RE) {
+                            self.channel.ccr().modify(|_, w| {w.en().clear_bit()});
+                            (self.buffer, self.channel, self.resource)
                         }
                     }
 
