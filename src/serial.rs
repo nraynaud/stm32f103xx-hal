@@ -1,6 +1,7 @@
 use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::{self, Ordering};
+use core::any::TypeId;
 
 use cast::u16;
 use nb;
@@ -139,8 +140,15 @@ macro_rules! hal {
 
                     // enable DMA transfers
                     usart.cr3.write(|w| w.dmat().set_bit().dmar().set_bit());
+                    let bus_freq = if TypeId::of::<$APB>() == TypeId::of::<APB1>() {
+                        clocks.pclk1()
+                    } else if TypeId::of::<$APB>() == TypeId::of::<APB2>() {
+                        clocks.pclk2()
+                    } else {
+                        unreachable!()
+                    };
 
-                    let brr = clocks.pclk2().0 / baud_rate.0;
+                    let brr = bus_freq.0 / baud_rate.0;
                     assert!(brr >= 16, "impossible baud rate");
                     usart.brr.write(|w| unsafe { w.bits(brr) });
 
@@ -378,7 +386,7 @@ macro_rules! hal {
             impl<A> WriteDmaImmediately<A> for Tx<$USARTX> where A: AsRef<[u8]> + ?Sized {
                 fn write_immediately(&mut self, chan: &mut Self::Dma, buffer: &A) {
                     self.start_dma(chan, &buffer);
-                    chan.wait_for_tranfer();
+                    chan.wait_for_tranfer(buffer);
                 }
             }
 
@@ -499,7 +507,7 @@ pub trait WriteDma<A, B>: DmaChannel
         B: Static<A>,
         Self: core::marker::Sized,
 {
-    fn write_all(self, mut chan: Self::Dma, buffer: B) -> Transfer<R, B, Self::Dma, Self>;
+    fn write_all(self, chan: Self::Dma, buffer: B) -> Transfer<R, B, Self::Dma, Self>;
 }
 
 pub trait WriteDmaImmediately<A>: DmaChannel
