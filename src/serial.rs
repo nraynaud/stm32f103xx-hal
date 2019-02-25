@@ -21,10 +21,12 @@ use embedded_hal::serial::Write;
 pub enum Event {
     /// New data has been received
     Rxne,
-    /// New data can be sent
+    /// New data can be sent (after each word)
     Txe,
     /// Receive line is idle
     Idle,
+    /// transmission is complete (end of DMA chunk)
+    Tc,
 }
 
 /// Serial error
@@ -95,6 +97,7 @@ pub struct Tx<USART> {
 }
 
 impl<USART, PINS: Pins<USART>> ReleaseToken<USART, PINS> {
+    /// waits for all communications to be done then release both Rx and Tx
     pub fn release(self, _rx: Rx<USART>, mut tx: Tx<USART>) -> Serial<USART, PINS>
         where Tx<USART>: crate::hal::serial::Write<u8> {
         nb::block!(tx.flush()).ok();
@@ -167,6 +170,7 @@ macro_rules! hal {
                         Event::Rxne => self.usart.cr1.modify(|_, w| w.rxneie().set_bit()),
                         Event::Txe => self.usart.cr1.modify(|_, w| w.txeie().set_bit()),
                         Event::Idle => self.usart.cr1.modify(|_, w| w.idleie().set_bit()),
+                        Event::Tc => self.usart.cr1.modify(|_, w| w.tcie().set_bit()),
                     }
                 }
 
@@ -175,6 +179,7 @@ macro_rules! hal {
                         Event::Rxne => self.usart.cr1.modify(|_, w| w.rxneie().clear_bit()),
                         Event::Txe => self.usart.cr1.modify(|_, w| w.txeie().clear_bit()),
                         Event::Idle => self.usart.cr1.modify(|_, w| w.idleie().clear_bit()),
+                        Event::Tc => self.usart.cr1.modify(|_, w| w.tcie().clear_bit()),
                     }
                 }
 
